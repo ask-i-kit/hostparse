@@ -28,6 +28,7 @@ SJIS・改行なしの固定長レコードファイルを、コピー句 / 手�
 import argparse
 import csv
 import io
+import math
 import os
 import re
 import sys
@@ -523,28 +524,59 @@ def _is_trail(b):
     return 0x40 <= b <= 0x7E or 0x80 <= b <= 0xFC
 
 
+# 列の均質さ判定を高速化するための変換表。
+# クラス c ごとに「そのバイトが c か 空白(クラス0) なら 0x01」の表を用意しておくと、
+# bytes.translate と多倍長整数のビット演算だけで全列をまとめて判定できる。
+_CLASS_MASKS = [bytes(1 if _byte_class(b) in (c, 0) else 0 for b in range(256))
+                for c in range(1, 6)]
+
+DETECT_SAMPLE = 16              # レコード長判定に使うレコード数
+DETECT_SAMPLE_BYTES = 1 << 20   # 先頭何バイトを読むか (1MB)
+
+
+def _divisors_upto(size: int, max_len: int) -> list:
+    """size の約数のうち 2 以上 min(size, max_len) 以下のものを昇順で返す。"""
+    hi = min(size, max_len)
+    ds = set()
+    for d in range(1, math.isqrt(size) + 1):
+        if size % d:
+            continue
+        for x in (d, size // d):
+            if 2 <= x <= hi:
+                ds.add(x)
+    return sorted(ds)
+
+
 def detect_record_length(path: str, max_len: int = 65536):
     """ファイルサイズの約数を候補に、列の均質さでレコード長を推定する。"""
     size = os.path.getsize(path)
-    cands = [d for d in range(2, min(size, max_len) + 1) if size % d == 0]
+    cands = _divisors_upto(size, max_len)
     if not cands:
         return None, []
-    results = []
+    SAMPLE = DETECT_SAMPLE
+    # 最長候補 × SAMPLE 件ぶん読めば判定には十分。読込量を固定し、
+    # ファイルサイズによらず一定時間で終わるようにする。
     with open(path, "rb") as fp:
-        head = fp.read(min(size, 4 * 1024 * 1024))
-    SAMPLE = 16
+        head = fp.read(min(size, max(DETECT_SAMPLE_BYTES, max_len * SAMPLE)))
+    # クラスごとに「その位置が そのクラス or 空白 なら 0x01」の平面を作る (C側で1パス)
+    planes = [head.translate(m) for m in _CLASS_MASKS]
+    results = []
     for rl in cands:
         avail = len(head) // rl
         if avail < 4:
             continue  # サンプル不足の候補は信頼できない
         nrec = min(avail, SAMPLE)
-        recs = [head[i * rl:(i + 1) * rl] for i in range(nrec)]
-        uniform = 0
-        for col in range(rl):
-            classes = {_byte_class(r[col]) for r in recs}
-            classes.discard(0)  # 空白は無視
-            if len(classes) <= 1:
-                uniform += 1
+        # 列が均質 = いずれかのクラスで全レコードのビットが立ったまま残る
+        # (バイトは 0x00/0x01 なので bit_count() がそのまま均質な列数になる)
+        total = 0
+        for p in planes:
+            x = int.from_bytes(p[:rl], "big")
+            for i in range(1, nrec):
+                x &= int.from_bytes(p[i * rl:(i + 1) * rl], "big")
+                if not x:
+                    break
+            total |= x
+        uniform = total.bit_count()
         # サンプル数が少ない候補は偶然揃いやすいためペナルティを課す
         score = uniform / rl - 0.03 * (SAMPLE - nrec)
         results.append((rl, score))

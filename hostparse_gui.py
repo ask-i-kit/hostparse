@@ -14,6 +14,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -34,6 +35,8 @@ CODE2LABEL = dict(TYPE_LABELS)
 LABEL2CODE = {v: k for k, v in TYPE_LABELS}
 
 PREVIEW_RECORDS = 200
+DUMP_RECORDS = 5        # 16進ダンプに表示するレコード数
+DUMP_BYTES = 512        # レコード長が未確定のときにダンプするバイト数
 
 
 def field_type_code(f: hp.Field) -> str:
@@ -60,13 +63,63 @@ class App(tk.Tk):
         self.fields = []          # list[hp.Field]
         self.msg_q = queue.Queue()
         self.converting = False
+        self._input_size = None   # 入力ファイルサイズ (パス変更時のみ取得)
+        self._bg_running = set()  # 実行中のバックグラウンド処理キー
+        self._prev_cols_sig = None  # プレビューの列構成 (変化時のみ組み直す)
+        self._preview_status = None  # プレビュー完了時に出すステータス (上書き用)
+        self._guess_after_detect = False  # 自動検出の完了後に推測へ続けるか
+        self._input_reload_job = None     # 入力パス変更のデバウンス用
 
         self._build_ui()
+        # キー -> 完了時にUIスレッドで呼ぶハンドラ (result, err, elapsed)
+        self._bg_handlers = {
+            "fileinfo": self._on_fileinfo,
+            "dump": self._on_dump,
+            "detect": self._on_detect,
+            "guess": self._on_guess,
+            "preview": self._on_preview,
+        }
         self.after(100, self._poll_queue)
+
+    # ------------------------------------------------- バックグラウンド実行
+    def _run_bg(self, key, fn, busy_msg):
+        """fn() をワーカースレッドで実行する。
+
+        fn はファイルI/Oと純粋計算のみを行い、Tk ウィジェットには一切触れない。
+        結果は ("bg", key, result, err) としてキューに載り、UIスレッド上の
+        self._bg_handlers[key] が受け取る。
+        """
+        if key in self._bg_running:
+            return False        # 同じ処理の多重実行は無視する
+        self._bg_running.add(key)
+        self._update_busy()
+        self.var_status.set(busy_msg)
+
+        def worker():
+            t0 = time.perf_counter()
+            try:
+                result = fn()
+            except Exception as e:       # noqa: BLE001 - UI側でまとめて通知する
+                self.msg_q.put(("bg", key, None, e, 0.0))
+            else:
+                self.msg_q.put(("bg", key, result, None,
+                                time.perf_counter() - t0))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _update_busy(self):
+        """処理中はカーソルを待機表示にし、ファイルを触るボタンを止める。"""
+        busy = bool(self._bg_running)
+        self.configure(cursor="watch" if busy else "")
+        state = "disabled" if busy else "normal"
+        for btn in self._busy_buttons:
+            btn.configure(state=state)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         pad = {"padx": 4, "pady": 2}
+        self._busy_buttons = []   # 処理中に無効化するボタン
 
         # ===== 入力ファイル =====
         frm_file = ttk.LabelFrame(self, text=" 入力ファイル (SJIS・改行なし固定長) ")
@@ -74,19 +127,22 @@ class App(tk.Tk):
         self.var_input = tk.StringVar()
         ttk.Entry(frm_file, textvariable=self.var_input).grid(
             row=0, column=0, sticky="ew", **pad)
-        ttk.Button(frm_file, text="参照...", command=self.pick_input).grid(
-            row=0, column=1, **pad)
+        btn = ttk.Button(frm_file, text="参照...", command=self.pick_input)
+        btn.grid(row=0, column=1, **pad)
+        self._busy_buttons.append(btn)
         ttk.Label(frm_file, text="レコード長:").grid(row=0, column=2, **pad)
         self.var_reclen = tk.StringVar()
         ent = ttk.Entry(frm_file, textvariable=self.var_reclen, width=8)
         ent.grid(row=0, column=3, **pad)
-        ttk.Button(frm_file, text="自動検出", command=self.detect_reclen).grid(
-            row=0, column=4, **pad)
+        btn = ttk.Button(frm_file, text="自動検出", command=self.detect_reclen)
+        btn.grid(row=0, column=4, **pad)
+        self._busy_buttons.append(btn)
         self.var_fileinfo = tk.StringVar(value="ファイル未選択")
         ttk.Label(frm_file, textvariable=self.var_fileinfo, foreground="#555").grid(
             row=1, column=0, columnspan=5, sticky="w", **pad)
         frm_file.columnconfigure(0, weight=1)
         self.var_reclen.trace_add("write", lambda *a: self._update_fileinfo())
+        self.var_input.trace_add("write", lambda *a: self._schedule_input_reload())
 
         # ===== 中央: レイアウト(左) + プレビュー(右) =====
         # (pack は _build_ui 末尾で行う: 下部セクションの表示領域を先に確保するため)
@@ -98,11 +154,12 @@ class App(tk.Tk):
 
         bar = ttk.Frame(frm_layout)
         bar.pack(fill="x", padx=4, pady=2)
-        ttk.Button(bar, text="コピー句 読込", command=self.load_copybook).pack(
-            side="left", padx=2)
-        ttk.Button(bar, text="レイアウトCSV 読込", command=self.load_layout).pack(
-            side="left", padx=2)
-        ttk.Button(bar, text="推測", command=self.guess).pack(side="left", padx=2)
+        for text, cmd in (("コピー句 読込", self.load_copybook),
+                          ("レイアウトCSV 読込", self.load_layout),
+                          ("推測", self.guess)):
+            btn = ttk.Button(bar, text=text, command=cmd)
+            btn.pack(side="left", padx=2)
+            self._busy_buttons.append(btn)
         ttk.Button(bar, text="CSV保存", command=self.save_layout).pack(
             side="left", padx=2)
         ttk.Button(bar, text="全クリア", command=self.clear_layout).pack(
@@ -161,8 +218,9 @@ class App(tk.Tk):
         nb.add(frm_prev, text=f" プレビュー (先頭{PREVIEW_RECORDS}件) ")
         bar2 = ttk.Frame(frm_prev)
         bar2.pack(fill="x")
-        ttk.Button(bar2, text="プレビュー更新", command=self.refresh_preview).pack(
-            side="left", padx=2, pady=2)
+        btn = ttk.Button(bar2, text="プレビュー更新", command=self.refresh_preview)
+        btn.pack(side="left", padx=2, pady=2)
+        self._busy_buttons.append(btn)
         self.var_previnfo = tk.StringVar()
         ttk.Label(bar2, textvariable=self.var_previnfo, foreground="#555").pack(
             side="left", padx=8)
@@ -233,18 +291,49 @@ class App(tk.Tk):
         if not path:
             return
         self.var_input.set(path)
-        self._update_fileinfo()
-        self.refresh_dump()
         base, _ = os.path.splitext(path)
         self.var_output.set(base + "_変換.csv")
+        self._schedule_input_reload(delay=0)   # 明示的な選択なので待たない
+
+    def _schedule_input_reload(self, delay=300):
+        """入力パスの変更をまとめて処理する (直接入力中にファイルを叩かない)。"""
+        if self._input_reload_job is not None:
+            self.after_cancel(self._input_reload_job)
+        self._input_size = None
+        self._input_reload_job = self.after(delay, self._reload_input)
+
+    def _reload_input(self):
+        self._input_reload_job = None
+        path = self.var_input.get().strip()
+        if not path:
+            self.var_fileinfo.set("ファイル未選択")
+            return
+        self.var_fileinfo.set("ファイル情報を読込んでいます...")
+        # ネットワークドライブやクラウド同期フォルダでは getsize/read 自体が
+        # ブロックしうるため、サイズ取得もダンプもワーカースレッドで行う。
+        if not self._run_bg("fileinfo", lambda: os.path.getsize(path),
+                            "ファイル情報を読込んでいます..."):
+            self._input_reload_job = self.after(200, self._reload_input)
+
+    def _on_fileinfo(self, size, err, elapsed=0.0):
+        if err:
+            self._input_size = None
+            self.var_fileinfo.set("ファイルを読めません")
+            self.var_status.set(f"入力ファイルを読めません: {err}")
+            return
+        self._input_size = size
+        self._update_fileinfo()
+        self.refresh_dump()
         self.var_status.set("レイアウトを指定してください (コピー句読込 / 推測 / 手動追加)")
 
     def _update_fileinfo(self):
-        path = self.var_input.get()
-        if not os.path.isfile(path):
-            self.var_fileinfo.set("ファイル未選択")
+        """キャッシュ済みサイズから表示を組み立てる (ファイルには触らない)。"""
+        if self._input_size is None:
+            self.var_fileinfo.set("ファイル情報を読込んでいます..."
+                                  if self.var_input.get().strip()
+                                  else "ファイル未選択")
             return
-        size = os.path.getsize(path)
+        size = self._input_size
         rl = self._get_reclen(silent=True)
         if rl:
             nrec, rem = divmod(size, rl)
@@ -281,9 +370,16 @@ class App(tk.Tk):
         path = self._need_input()
         if not path:
             return
-        self.var_status.set("レコード長を検出しています...")
-        self.update_idletasks()
-        rl, cands = hp.detect_record_length(path)
+        self._run_bg("detect", lambda: hp.detect_record_length(path),
+                     "レコード長を検出しています...")
+
+    def _on_detect(self, result, err, elapsed=0.0):
+        chain_guess, self._guess_after_detect = self._guess_after_detect, False
+        if err:
+            self.var_status.set(f"レコード長の検出に失敗しました: {err}")
+            messagebox.showerror("自動検出", f"レコード長を検出できませんでした:\n{err}")
+            return
+        rl, cands = result
         if rl is None:
             messagebox.showwarning(
                 "自動検出", "レコード長を検出できませんでした。\n"
@@ -291,10 +387,14 @@ class App(tk.Tk):
             self.var_status.set("レコード長の検出に失敗しました")
             return
         self.var_reclen.set(str(rl))
-        cand_str = ", ".join(f"{r}({s:.0%})" for r, s in cands)
-        self.var_status.set(f"レコード長 {rl} バイトと推定 (候補: {cand_str})")
         self._update_fileinfo()
         self.refresh_dump()
+        if chain_guess:
+            self.guess()
+            return
+        cand_str = ", ".join(f"{r}({s:.0%})" for r, s in cands)
+        self.var_status.set(       # 後続処理のメッセージを消さないよう最後に表示
+            f"レコード長 {rl} バイトと推定 (候補: {cand_str}) / {elapsed:.2f}秒")
 
     # ------------------------------------------------------------ レイアウト
     def _refresh_tree(self):
@@ -445,27 +545,44 @@ class App(tk.Tk):
             return
         rl = self._get_reclen(silent=True)
         if not rl:
-            self.detect_reclen()
-            rl = self._get_reclen(silent=True)
-            if not rl:
-                return
+            # レコード長が未設定なら先に検出し、その完了後に改めて推測する
+            if self._run_bg("detect", lambda: hp.detect_record_length(path),
+                            "レコード長を検出しています..."):
+                self._guess_after_detect = True
+            return
+        self._run_bg("guess", lambda: self._guess_worker(path, rl),
+                     "レイアウトを推測しています...")
+
+    @staticmethod
+    def _guess_worker(path, rl):
         with open(path, "rb") as fp:
             sample = fp.read(rl * 1000)
         nsamp = len(sample) // rl
         if nsamp == 0:
+            return None
+        records = [sample[i * rl:(i + 1) * rl] for i in range(nsamp)]
+        return hp.guess_layout(records)
+
+    def _on_guess(self, fields, err, elapsed=0.0):
+        if err:
+            self.var_status.set(f"推測に失敗しました: {err}")
+            messagebox.showerror("推測", f"レイアウトを推測できませんでした:\n{err}")
+            return
+        if fields is None:
+            rl = self._get_reclen(silent=True)
             messagebox.showwarning("推測", f"ファイルが1レコード({rl}バイト)未満です")
             return
-        records = [sample[i * rl:(i + 1) * rl] for i in range(nsamp)]
-        self.fields = hp.guess_layout(records)
+        self.fields = fields
         self._refresh_tree()
-        self.refresh_preview()
-        self.var_status.set(
-            f"レイアウトを推測しました: {len(self.fields)}項目 "
+        # プレビュー完了時のメッセージで推測の注意書きが消えないよう明示的に渡す
+        self.refresh_preview(status=(
+            f"レイアウトを推測しました: {len(self.fields)}項目 ({elapsed:.2f}秒) "
             "※推測結果です。プレビューを確認し、必要に応じて修正してください "
-            "(パックの小数桁・バイナリ項目は判別できません)")
+            "(パックの小数桁・バイナリ項目は判別できません)"))
 
     # ------------------------------------------------------------ プレビュー
-    def refresh_preview(self):
+    def refresh_preview(self, status=None):
+        """status を渡すと、完了時のステータス表示をそれで上書きする。"""
         path = self._need_input()
         if not path:
             return
@@ -483,60 +600,97 @@ class App(tk.Tk):
                 + ", ".join(f"{f.name}(終端{f.start + f.length})" for f in over[:5]))
             return
 
+        fields = list(self.fields)
+        keep_zeros = self.var_keepzeros.get()
+        self._preview_status = status
+        self._run_bg("preview",
+                     lambda: self._preview_worker(path, rl, fields, keep_zeros),
+                     "プレビューを作成しています...")
+
+    @staticmethod
+    def _preview_worker(path, rl, fields, keep_zeros):
+        """先頭 PREVIEW_RECORDS 件だけを読んで行データを組み立てる。
+
+        読込量はレコード長 × 件数で頭打ちなので、ファイルサイズには依存しない。
+        """
         errors = hp.ErrorCounter()
         convs = [(slice(f.start, f.start + f.length),
-                  hp.make_converter(f, True, self.var_keepzeros.get(), errors))
-                 for f in self.fields]
+                  hp.make_converter(f, True, keep_zeros, errors))
+                 for f in fields]
         with open(path, "rb") as fp:
             data = fp.read(rl * PREVIEW_RECORDS)
+        rows = [[fn(data[off + sl.start:off + sl.stop]) for sl, fn in convs]
+                for off in range(0, (len(data) // rl) * rl, rl)]
+        return fields, rows, errors.count
 
+    def _on_preview(self, result, err, elapsed=0.0):
+        if err:
+            self.var_status.set(f"プレビューに失敗しました: {err}")
+            messagebox.showerror("プレビュー", f"プレビューを作成できませんでした:\n{err}")
+            return
+        fields, rows, nerr = result
+        # 列構成が変わっていなければ組み直さず、行の入替えだけで済ませる
+        sig = tuple((f.name, f.ftype, f.length, f.scale) for f in fields)
+        if sig != self._prev_cols_sig:
+            self.prev.configure(columns=list(range(len(fields))))
+            for i, f in enumerate(fields):
+                self.prev.heading(i, text=f.name)
+                w = max(60, min(240, max(len(f.name), hp.display_width(f)) * 9))
+                self.prev.column(i, width=w,
+                                 anchor="e" if f.ftype in "9PB" else "w",
+                                 stretch=False)
+            self._prev_cols_sig = sig
         self.prev.delete(*self.prev.get_children())
-        names = [f.name for f in self.fields]
-        self.prev.configure(columns=list(range(len(names))))
-        for i, (name, f) in enumerate(zip(names, self.fields)):
-            self.prev.heading(i, text=name)
-            w = max(60, min(240, max(len(name), hp.display_width(f)) * 9))
-            self.prev.column(i, width=w, anchor="e" if f.ftype in "9PB" else "w",
-                             stretch=False)
-        n = 0
-        for off in range(0, (len(data) // rl) * rl, rl):
-            row = [fn(data[off + sl.start:off + sl.stop]) for sl, fn in convs]
+        for row in rows:
             self.prev.insert("", "end", values=row)
-            n += 1
-        info = f"{n} 件表示"
-        if errors.count:
-            info += f" / 変換エラー {errors.count} 件 (#ERR表示) — レイアウトを確認してください"
+        info = f"{len(rows)} 件表示 / {elapsed:.2f}秒"
+        if nerr:
+            info += f" / 変換エラー {nerr} 件 (#ERR表示) — レイアウトを確認してください"
         self.var_previnfo.set(info)
-        self.var_status.set(f"プレビューを更新しました ({info})")
+        self.var_status.set(self._preview_status
+                            or f"プレビューを更新しました ({info})")
 
     def refresh_dump(self):
         path = self.var_input.get()
-        if not os.path.isfile(path):
+        if not path:
             return
         rl = self._get_reclen(silent=True)
+        self._run_bg("dump", lambda: self._dump_worker(path, rl),
+                     "16進ダンプを作成しています...")
+
+    @staticmethod
+    def _dump_worker(path, rl):
+        """先頭 DUMP_RECORDS 件 (レコード長未確定なら DUMP_BYTES) だけダンプする。"""
         with open(path, "rb") as fp:
-            data = fp.read((rl or 64) * 5 if rl else 512)
+            data = fp.read(rl * DUMP_RECORDS if rl else DUMP_BYTES)
+
+        def hex_lines(seq):
+            out = []
+            for off in range(0, len(seq), 16):
+                seg = seq[off:off + 16]
+                hexs = " ".join(f"{b:02X}" for b in seg).ljust(47)
+                chars = seg.decode("cp932", "replace").replace("�", "･")
+                out.append(f"{off + 1:>5}: {hexs} | {chars}")
+            return out
+
         lines = []
         if rl:
             # レコード単位: 1行16バイトで位置(1始まり)を表示
-            for r in range(min(5, len(data) // rl)):
-                rec = data[r * rl:(r + 1) * rl]
+            for r in range(min(DUMP_RECORDS, len(data) // rl)):
                 lines.append(f"===== レコード {r + 1} =====")
-                for off in range(0, len(rec), 16):
-                    seg = rec[off:off + 16]
-                    hexs = " ".join(f"{b:02X}" for b in seg).ljust(47)
-                    chars = seg.decode("cp932", "replace").replace("�", "･")
-                    lines.append(f"{off + 1:>5}: {hexs} | {chars}")
+                lines += hex_lines(data[r * rl:(r + 1) * rl])
                 lines.append("")
         else:
-            for off in range(0, len(data), 16):
-                seg = data[off:off + 16]
-                hexs = " ".join(f"{b:02X}" for b in seg).ljust(47)
-                chars = seg.decode("cp932", "replace").replace("�", "･")
-                lines.append(f"{off + 1:>5}: {hexs} | {chars}")
+            lines = hex_lines(data)
+        return "\n".join(lines)
+
+    def _on_dump(self, text, err, elapsed=0.0):
+        if err:
+            self.var_status.set(f"16進ダンプを作成できませんでした: {err}")
+            return
         self.dump.configure(state="normal")
         self.dump.delete("1.0", "end")
-        self.dump.insert("1.0", "\n".join(lines))
+        self.dump.insert("1.0", text)
         self.dump.configure(state="disabled")
 
     # ------------------------------------------------------------ 変換
@@ -643,7 +797,12 @@ class App(tk.Tk):
         try:
             while True:
                 msg = self.msg_q.get_nowait()
-                if msg[0] == "progress":
+                if msg[0] == "bg":
+                    _, key, result, err, elapsed = msg
+                    self._bg_running.discard(key)
+                    self._update_busy()
+                    self._bg_handlers[key](result, err, elapsed)
+                elif msg[0] == "progress":
                     self.progress["value"] = msg[1] * 1000
                 elif msg[0] == "done":
                     _, nrec, nerr, out = msg
