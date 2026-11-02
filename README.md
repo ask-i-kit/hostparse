@@ -2,11 +2,35 @@
 
 SJIS(CP932)・改行なしの固定長レコードファイル(メインフレームから転送したデータなど)をパースして、テキストまたはCSVに変換するツール。**パック10進(COMP-3)項目の展開に対応**。
 
-Python 3.10 以降の標準ライブラリのみで動作(追加インストール不要)。
+Go と [Walk](https://github.com/lxn/walk) で実装。ビルド済みの exe は単体で動作する(実行時の追加インストール不要)。Windows 専用。
+
+## ビルド
+
+Go 1.26 以降が必要。`build.bat` を実行すると `hostparse.exe`(CLI)と `hostparse-gui.exe`(GUI)ができる。
+
+```powershell
+.uild.bat
+```
+
+GUI の exe には Common Controls v6 のマニフェストが必須で、`cmd/hostparse-gui/rsrc_windows_amd64.syso` として埋め込んでいる。マニフェストを変更したら作り直す。
+
+```powershell
+go run ./tools/mksyso cmd/hostparse-gui/hostparse-gui.manifest cmd/hostparse-gui/rsrc_windows_amd64.syso
+```
+
+| ディレクトリ | 内容 |
+|---|---|
+| `engine/` | パース・変換エンジン(CLI/GUI 共通) |
+| `cmd/hostparse/` | CLI版 |
+| `cmd/hostparse-gui/` | GUI版(Walk) |
+| `cmd/make-sample/` | テスト用データ生成 |
+| `tools/mksyso/` | マニフェスト埋込用 `.syso` の生成 |
+
+テストは `go test ./engine`。
 
 ## GUI版
 
-**`hostparse_gui.bat` をダブルクリック**(または `python hostparse_gui.py`)で起動。
+**`hostparse-gui.exe` をダブルクリック**で起動。
 
 使い方の流れ:
 
@@ -30,17 +54,17 @@ Python 3.10 以降の標準ライブラリのみで動作(追加インストー�
 
 ```powershell
 # ① コピー句(COBOL COPY句)がある場合 — そのまま渡すだけ
-python hostparse.py data.dat -c copybook.cpy -o out.csv
+hostparse data.dat -c copybook.cpy -o out.csv
 
 # ② レイアウトが分かっている場合 — レイアウトCSVで指定
-python hostparse.py data.dat -l layout.csv -o out.csv
+hostparse data.dat -l layout.csv -o out.csv
 
 # ③ 少数の項目だけ手動指定 (名前,開始位置,バイト数,形式[,小数桁])
 #    ※ 部分指定のときはレコード長 -r が必須
-python hostparse.py data.dat --field "社員番号,1,5,9" --field "給与,26,5,パック,2" -r 46 -o out.csv
+hostparse data.dat --field "社員番号,1,5,9" --field "給与,26,5,パック,2" -r 46 -o out.csv
 
 # ④ レイアウト不明 — 推測させる (レコード長も自動検出)
-python hostparse.py data.dat --guess
+hostparse data.dat --guess
 #    → data.dat.layout.csv にレイアウト案が保存されるので、確認・修正して ② で再実行
 ```
 
@@ -94,7 +118,7 @@ python hostparse.py data.dat --guess
 - 固定形式(1〜6桁目の行番号・7桁目の `*` コメント)/自由形式とも可
 - 編集項目(`ZZZ,ZZ9` など)は文字として扱う
 
-コピー句の文字コードは自動判定(UTF-8 / SJIS)。`--copybook-encoding` で明示も可。
+コピー句の文字コードは自動判定(UTF-8 / SJIS)。`--copybook-encoding` で明示も可(`utf-8`、`utf-8-sig`、`cp932`、`sjis`、`euc-jp`、`iso-2022-jp` など)。
 
 ## その他のオプション
 
@@ -112,16 +136,26 @@ python hostparse.py data.dat --guess
 
 ## 性能の目安
 
-約 20万レコード/秒・9MB/s(46バイト×200万レコード=88MB を約10秒)。
+約 130万レコード/秒・60MB/s(46バイト×200万レコード=92MB を約1.6秒)。
 チャンク読み込み+項目ごとの事前生成変換関数で、ファイルサイズによらずメモリ使用は一定。
 
-レコード長の自動検出は先頭1MBのみを読み、列の均質さの判定を
-`bytes.translate` と多倍長整数のビット演算でまとめて行うため、
+レコード長の自動検出は先頭1MBのみを読むため、
 ファイルサイズや約数の個数によらず 0.1 秒以内に終わる。
 
 ## テスト用データ生成
 
 ```powershell
-python make_sample.py 1000        # sample.dat (1000件) と sample.cpy を生成
-python hostparse.py sample.dat -c sample.cpy --limit 10
+go run ./cmd/make-sample 1000     # sample.dat (1000件) と sample.cpy を生成
+hostparse sample.dat -c sample.cpy --limit 10
 ```
+
+## Python版からの移行
+
+旧版の `hostparse.py` / `hostparse_gui.py` / `make_sample.py` はリポジトリに残している。変換結果(CSV・テキスト・レイアウトCSV)は旧版とバイト単位で同じ。次の点だけ異なる。
+
+- 出力先が入力ファイルと同じ場合は、CLI でもエラーにする(旧版の CLI は入力を上書きしていた)
+- `-r 0`、負の `--skip`、`--field` の開始位置 0 以下、負のバイト数・小数桁は、例外で落ちる代わりにエラーメッセージを出す
+- `--copybook-encoding` の指定できる名前が Python のコーデック名から上記の一覧に変わった
+- GUI の16進ダンプは、制御文字を `･` で表示する
+- コマンドライン誤りのメッセージ文面が変わった(終了コードは同じ)
+- `make-sample` が生成するデータの内容は旧版と異なる(形式は同じ)
